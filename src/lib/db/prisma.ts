@@ -21,6 +21,33 @@ type GlobalWithPrisma = typeof globalThis & {
 
 const g = globalThis as GlobalWithPrisma;
 
+/**
+ * Translate `?sslmode=` in DATABASE_URL into an explicit `ssl` option.
+ *
+ * `pg` treats `sslmode=require` as full certificate verification, which fails against Aiven
+ * (and most managed Postgres) because they sign with a private CA that Node does not trust.
+ * Values parsed from the connection string also override an explicit `ssl` object, so the
+ * parameter is stripped and TLS is configured here instead:
+ *   - DATABASE_CA_CERT set  → verify the chain against that PEM (recommended for production;
+ *     download it from Aiven → service → Overview → CA certificate)
+ *   - sslmode present       → encrypt, but do not verify the chain
+ *   - sslmode=disable/none  → plain TCP (local Docker Postgres)
+ */
+function connectionOptions(raw: string): { connectionString: string; ssl?: false | { ca?: string; rejectUnauthorized: boolean } } {
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    return { connectionString: raw };
+  }
+  const sslmode = url.searchParams.get("sslmode");
+  url.searchParams.delete("sslmode");
+  const ca = process.env.DATABASE_CA_CERT?.replaceAll("\\n", "\n").trim();
+  if (ca) return { connectionString: url.toString(), ssl: { ca, rejectUnauthorized: true } };
+  if (sslmode && sslmode !== "disable") return { connectionString: url.toString(), ssl: { rejectUnauthorized: false } };
+  return { connectionString: url.toString() };
+}
+
 function createPool(): Pool {
   const connectionString = process.env.DATABASE_URL;
   if (!connectionString) {
@@ -30,7 +57,7 @@ function createPool(): Pool {
   }
   const max = Number.parseInt(process.env.DATABASE_POOL_MAX ?? "5", 10);
   return new Pool({
-    connectionString: connectionString || "postgresql://unset:unset@localhost:5432/unset",
+    ...connectionOptions(connectionString || "postgresql://unset:unset@localhost:5432/unset"),
     max: Number.isFinite(max) && max > 0 ? max : 5,
     idleTimeoutMillis: 30_000,
     connectionTimeoutMillis: 10_000,

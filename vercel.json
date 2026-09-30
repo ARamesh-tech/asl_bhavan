@@ -1,0 +1,10 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "framework": "nextjs",
+  "buildCommand": "prisma migrate deploy && npm run build",
+  "regions": ["bom1"],
+  "crons": [
+    { "path": "/api/cron/expire-holds", "schedule": "*/5 * * * *" },
+    { "path": "/api/cron/expire-holds?instagram=1", "schedule": "0 */6 * * *" }
+  ]
+}

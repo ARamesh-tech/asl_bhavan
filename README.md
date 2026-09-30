@@ -13,16 +13,16 @@ hard-coded.
 | Database   | PostgreSQL on **Aiven**, Prisma 7 (`@prisma/adapter-pg`, small pool)       |
 | Auth       | Cookie sessions stored in Postgres, bcrypt password hashes, RBAC           |
 | Payments   | Razorpay Orders API + Checkout + signed webhooks                           |
-| Email      | Resend (with delivery log + resend from admin)                             |
+| Email      | SMTP via nodemailer (Gmail, Zoho, Brevo, SES, …) with delivery log + resend |
 | Files      | Local disk (dev) or any S3-compatible bucket (prod)                        |
 | PDF        | pdfkit (receipts rendered server-side from a frozen snapshot)              |
-| Hosting    | Render web service (GitHub auto-deploy) + Aiven Postgres                   |
+| Hosting    | Render web service **or** Vercel (GitHub auto-deploy) + Aiven Postgres     |
 
 ---
 
 ## Contents
 
-1. [Quick start (local)](#1-quick-start-local)
+1. [Running the app: local development & production mode](#1-running-the-app-local-development--production-mode)
 2. [Environment variables](#2-environment-variables)
 3. [Database: Prisma, migrations, seed](#3-database-prisma-migrations-seed)
 4. [Project structure](#4-project-structure)
@@ -34,30 +34,80 @@ hard-coded.
 10. [Scheduled jobs](#10-scheduled-jobs)
 11. [Security notes](#11-security-notes)
 12. [Testing & quality gates](#12-testing--quality-gates)
-13. [Deploying to Render + Aiven](#13-deploying-to-render--aiven)
+13. [Deploying](#13-deploying) — [Aiven database](#131-aiven-postgresql-both-hosts) · [Render](#132-render-web-service) · [Vercel](#133-vercel) · [Any VPS / Docker host](#134-any-vps-or-docker-host)
 14. [Backups & restore](#14-backups--restore)
 15. [Troubleshooting](#15-troubleshooting)
 
 ---
 
-## 1. Quick start (local)
+## 1. Running the app: local development & production mode
 
-Requirements: Node 20+ (tested on 24), npm, and a PostgreSQL 14+ database (Aiven works fine
-for development too; there is no local Postgres requirement).
+### 1.1 Prerequisites
+
+- **Node.js 20+** (developed on Node 24) and npm 10+
+- A **PostgreSQL 14+** database. There is no local-Postgres requirement — a free Aiven
+  service works for development too. If you prefer local, `docker run --name asl-pg -e
+  POSTGRES_PASSWORD=postgres -p 5432:5432 -d postgres:16` and use
+  `DATABASE_URL=postgresql://postgres:postgres@localhost:5432/postgres` (drop `?sslmode=require`).
+- Optional: Razorpay test keys, SMTP credentials, an Instagram Graph token. Without them the
+  corresponding features are simply hidden/disabled — the app never shows broken buttons.
+
+### 1.2 Start locally (development)
 
 ```bash
 git clone <your-repo-url> asl-bhavan && cd asl-bhavan
 npm install                       # also runs `prisma generate`
-cp .env.example .env              # fill in DATABASE_URL, SESSION_SECRET, ADMIN_*
-npm run prisma:deploy             # apply migrations (creates btree_gist + exclusion constraint)
-npm run prisma:seed               # settings, amenities, 8 rooms + 1 dorm, admin user
-npm run dev                       # http://localhost:3000  (admin: /admin)
+cp .env.example .env              # Windows PowerShell: Copy-Item .env.example .env
 ```
 
-Sign in at `/login` with `ADMIN_EMAIL` / `ADMIN_PASSWORD` from your `.env`. The seed only
-creates the admin if that email does not exist yet; it never overwrites a password.
+Edit `.env` — the minimum for a working dev setup:
 
-Useful scripts:
+```dotenv
+DATABASE_URL="postgres://USER:PASSWORD@HOST:PORT/defaultdb?sslmode=require"
+SESSION_SECRET="<openssl rand -base64 48>"
+NEXT_PUBLIC_SITE_URL=http://localhost:3000
+ADMIN_EMAIL=you@example.com
+ADMIN_PASSWORD=<a strong password, used only once by the seed>
+```
+
+Then:
+
+```bash
+npm run prisma:deploy             # apply migrations (creates btree_gist + exclusion constraint)
+npm run prisma:seed               # settings, amenities, 8 rooms + 1 dorm, admin user (idempotent)
+npm run dev                       # http://localhost:3000  ·  admin at /admin
+```
+
+Sign in at `/login` with `ADMIN_EMAIL` / `ADMIN_PASSWORD`. The seed only creates the admin if
+that email does not exist yet and never overwrites a password. Uploaded images go to
+`public/uploads/` (git-ignored) while `STORAGE_PROVIDER=local`.
+
+To test Razorpay locally, add test-mode `RAZORPAY_KEY_ID` / `RAZORPAY_KEY_SECRET`. For the
+webhook, expose your dev server (`npx localtunnel --port 3000` or `ngrok http 3000`) and point a
+Razorpay test webhook at `https://<tunnel>/api/payments/webhook`. Emails need the `SMTP_*` variables;
+without it every send is logged as FAILED in Admin → Emails so you can still see what would go out.
+
+### 1.3 Run the production build locally (or on any server)
+
+Production mode is what Render, Vercel or a VPS runs. Try it locally before deploying:
+
+```bash
+npm ci                            # clean install from package-lock.json
+npm run typecheck && npm run lint && npm test
+npm run build                     # prisma generate + next build  (NODE_ENV=production is implied)
+npm run prisma:deploy             # forward-only migrations against the production database
+npm run start                     # serves the optimised build on http://localhost:3000
+```
+
+Set `PORT=8080 npm run start` (PowerShell: `$env:PORT=8080; npm run start`) to change the port.
+In production you must also set `NODE_ENV=production`, a real `NEXT_PUBLIC_SITE_URL` (https),
+`CRON_SECRET`, and — unless the host has a persistent disk — `STORAGE_PROVIDER=s3` with the
+`S3_*` variables. Run `npm run prisma:seed` once against the production database to create the
+admin, then change the password from `/profile` and remove `ADMIN_PASSWORD` from the environment.
+
+Hosted step-by-step guides are in [section 13](#13-deploying).
+
+### 1.4 Useful scripts
 
 | Script                    | What it does                                                  |
 | ------------------------- | ------------------------------------------------------------- |
@@ -82,17 +132,18 @@ See [`.env.example`](.env.example) for the annotated list. Summary:
 | ---------------------------------------------------- | -------- | ---------------------------------------------------------------------- |
 | `DATABASE_URL`                                       | yes      | Aiven URI **with `?sslmode=require`**                                  |
 | `DATABASE_POOL_MAX`                                  | no (5)   | Keep ≤ 5 on Aiven free/hobby tiers                                     |
+| `DATABASE_CA_CERT`                                   | no       | Aiven CA certificate (PEM) for full TLS verification; otherwise encrypted-only |
 | `SESSION_SECRET`                                     | yes      | ≥ 32 chars; signs the `asl_session` cookie                             |
 | `NEXT_PUBLIC_SITE_URL`                               | yes      | Public origin, used in emails/receipts/sitemap                         |
 | `ADMIN_EMAIL`, `ADMIN_PASSWORD`, `ADMIN_NAME`        | seed     | Used **only** by the seed to create the first admin                    |
 | `RAZORPAY_KEY_ID`, `RAZORPAY_KEY_SECRET`             | optional | Enables "Pay online". Without them the option is hidden, not broken     |
 | `RAZORPAY_WEBHOOK_SECRET`                            | optional | Enables `/api/payments/webhook`                                        |
-| `RESEND_API_KEY`, `RESEND_FROM_EMAIL`                | optional | Enables email. Without them sends are logged as FAILED (visible in admin) |
+| `SMTP_HOST`, `SMTP_PORT`, `SMTP_SECURE`, `SMTP_USER`, `SMTP_PASS`, `EMAIL_FROM` | optional | Enables email. Without them sends are logged as FAILED (visible in admin) |
 | `OWNER_NOTIFICATION_EMAIL`                           | optional | Fallback owner inbox (override in Admin → Settings → Notifications)    |
 | `INSTAGRAM_ACCESS_TOKEN`, `INSTAGRAM_ACCOUNT_ID`     | optional | Enables the "Sync Instagram" button and cron sync                      |
 | `CRON_SECRET`                                        | prod     | Bearer token for `/api/cron/expire-holds`                              |
 | `NEXT_PUBLIC_WHATSAPP_NUMBER`, `NEXT_PUBLIC_GOOGLE_MAPS_URL` | optional | Fallbacks; the values in Admin → Settings take precedence       |
-| `STORAGE_PROVIDER` + `S3_*`                          | prod     | `s3` for persistent uploads on Render (local disk is ephemeral)        |
+| `STORAGE_PROVIDER` + `S3_*`                          | prod     | `s3` for persistent uploads (Render disk is ephemeral; Vercel is read-only) |
 
 Only variables prefixed `NEXT_PUBLIC_` are ever shipped to the browser. `src/lib/env.ts`
 validates the server env with Zod on first access and fails fast with a readable list.
@@ -166,7 +217,7 @@ src/
                         access control, notifications, serialisation
     payments/           razorpay.ts (orders, verify, webhook, refunds), signature.ts
     receipts/           snapshot type, PDF renderer, receipt service
-    email/              Resend client + EmailLog, templates, branding, retry
+    email/              SMTP (nodemailer) client + EmailLog, templates, branding, retry
     instagram/          Graph API sync
     admin/              dashboard, bookings list/CSV, rooms, content, reports services
     storage/            local / S3 abstraction, image validation
@@ -278,6 +329,22 @@ transfer, pay on arrival), amount received and a transaction reference. Partial 
   the calling flow. Admin → Emails shows the ledger and can **Resend** booking/receipt emails
   (they are re-rendered from current data). Security emails with one-time tokens are not resendable.
 
+### SMTP setup
+
+Any SMTP provider works; set `SMTP_HOST`, `SMTP_PORT`, `SMTP_SECURE`, `SMTP_USER`, `SMTP_PASS`
+and `EMAIL_FROM`, then use **Send test email** in Admin → Emails.
+
+| Provider | Host / port | Notes |
+| --- | --- | --- |
+| Gmail / Google Workspace | `smtp.gmail.com` · 587 · `SMTP_SECURE=false` | Turn on 2-Step Verification → create an **App Password**; use it as `SMTP_PASS`. Gmail rewrites `EMAIL_FROM` to the account unless it is a verified "Send mail as" alias. ~500 mails/day (2 000 on Workspace) |
+| Zoho Mail | `smtp.zoho.in` · 587 | Use an app-specific password if 2FA is on |
+| Brevo (Sendinblue) | `smtp-relay.brevo.com` · 587 | Free 300/day; `SMTP_USER` is your login, `SMTP_PASS` the SMTP key |
+| Amazon SES | `email-smtp.<region>.amazonaws.com` · 587 | Create SMTP credentials in the SES console; verify the sender domain |
+| Mailgun / Postmark / SendGrid | see provider docs · 587 | Standard authenticated SMTP |
+
+Port 465 requires `SMTP_SECURE=true` (implicit TLS); 587 uses STARTTLS with `SMTP_SECURE=false`.
+For deliverability, send from a domain you own and add its SPF/DKIM records at your provider.
+
 ---
 
 ## 8. Instagram, gallery & content
@@ -319,14 +386,16 @@ Bookings, payments and receipts are soft-deleted (`deletedAt`) — never physica
 - purges expired sessions,
 - optionally `?instagram=1` runs an Instagram sync.
 
-Run it every 5 minutes (holds) from a Render Cron Job or any external scheduler, and once an hour
-or day with `?instagram=1`.
+Run it every 5 minutes (holds) and every few hours with `?instagram=1`. On Render use a Cron Job
+service; on Vercel the schedules in [`vercel.json`](vercel.json) are registered automatically and
+Vercel adds the `Authorization: Bearer $CRON_SECRET` header itself; elsewhere use crontab or
+cron-job.org. Details per host in section 13.
 
 ---
 
 ## 11. Security notes
 
-- Secrets (`DATABASE_URL`, `RAZORPAY_*`, `RESEND_API_KEY`, `SESSION_SECRET`, Instagram token,
+- Secrets (`DATABASE_URL`, `RAZORPAY_*`, `SMTP_PASS`, `SESSION_SECRET`, Instagram token,
   S3 keys) are read only in server code; nothing but `NEXT_PUBLIC_*` reaches the browser.
 - Passwords: bcrypt (cost 12). Sessions: random token, only its hash stored, HTTP-only, `Secure`
   in production, `SameSite=Lax`, revocable (role change / deactivation revokes all sessions).
@@ -360,42 +429,137 @@ run `prisma:deploy` + `prisma:seed`, and use the site or the API (`POST /api/boo
 
 ---
 
-## 13. Deploying to Render + Aiven
+## 13. Deploying
 
-### Aiven PostgreSQL
+The app is a standard Next.js server: it runs anywhere Node 20+ runs. Two first-class targets are
+documented below — **Render** (a long-running server; simplest) and **Vercel** (serverless). Both
+use the same Aiven PostgreSQL database and the same environment variables from section 2.
 
-1. Create a PostgreSQL service on Aiven (any plan). Copy the **Service URI**; it already contains
-   `?sslmode=require`.
-2. Optionally create a dedicated database/user instead of `defaultdb`/`avnadmin`.
-3. Note the connection limit of your plan and keep `DATABASE_POOL_MAX` small (Render runs one
-   instance by default → 5 is plenty).
+Whatever the host, the go-live checklist is the same:
 
-### Render web service
+1. Push the repository to GitHub (`git init && git add -A && git commit -m "Initial" && git push`).
+2. Create the Aiven database (13.1) and copy its URI.
+3. Create the web service, connect the GitHub repo, add the environment variables.
+4. First deploy applies migrations. Run `npm run prisma:seed` once to create the admin.
+5. Sign in, change the admin password at `/profile`, remove `ADMIN_PASSWORD` from the host env.
+6. Point object storage (`STORAGE_PROVIDER=s3`), Razorpay webhook, email sender domain and cron at the
+   final domain; set `NEXT_PUBLIC_SITE_URL=https://<your-domain>`.
+7. Make a ₹1 test booking with Razorpay test keys, then switch to live keys.
 
-1. Push this repository to GitHub.
-2. Render → **New → Web Service** → connect the repo.
-   - Runtime: Node · Region: closest to your guests (Singapore for India-based traffic works well)
+### 13.1 Aiven PostgreSQL (both hosts)
+
+1. Aiven console → **Create service → PostgreSQL** (any plan/region; Mumbai or Singapore for
+   India). Copy the **Service URI** — it already ends in `?sslmode=require`.
+2. Optionally create a dedicated database and user instead of `defaultdb` / `avnadmin`. The user
+   must be able to run `CREATE EXTENSION btree_gist` (`avnadmin` can).
+3. Mind the plan's connection limit. Keep `DATABASE_POOL_MAX=5` on Render (one process). On
+   Vercel every function instance opens its own pool — use `DATABASE_POOL_MAX=2` **and** enable
+   Aiven's built-in **connection pooling (PgBouncer)**: create a pool in *Connection pooling*,
+   mode *Transaction*, and use the pool's URI as `DATABASE_URL`.
+4. Enable automatic backups (on by default) — see section 14.
+
+### 13.2 Render (web service)
+
+1. Render → **New → Web Service** → connect the GitHub repo.
+   - Runtime: **Node** · Region: Singapore (closest to Indian guests)
    - Build command: `npm ci && npm run build`
    - Start command: `npx prisma migrate deploy && npm run start`
    - Health check path: `/`
-3. Environment → add every variable from section 2. Generate `SESSION_SECRET` and `CRON_SECRET`
-   with `openssl rand -base64 48`. Set `NEXT_PUBLIC_SITE_URL` to your Render URL (or custom domain).
-4. Storage: Render's disk is ephemeral → set `STORAGE_PROVIDER=s3` with an S3-compatible bucket
-   (Cloudflare R2 has a generous free tier; set `S3_ENDPOINT`, `S3_REGION=auto`, `S3_PUBLIC_URL`
-   to the bucket's public domain). Alternatively attach a Render Persistent Disk mounted at
-   `/opt/render/project/src/public/uploads` and keep `local`.
-5. First deploy runs migrations automatically. Then run the seed once from the Render **Shell**:
-   `npm run prisma:seed` (make sure `ADMIN_EMAIL` / `ADMIN_PASSWORD` are set; change the password
-   afterwards from `/profile`, and you may then remove `ADMIN_PASSWORD` from the environment).
-6. Create a **Cron Job** on Render (or use cron-job.org):
-   `curl -fsS -H "Authorization: Bearer $CRON_SECRET" https://<domain>/api/cron/expire-holds`
-   every 5 minutes, and the `?instagram=1` variant hourly.
-7. Razorpay: switch to live keys, add the webhook URL, verify with a ₹1 test booking.
-8. Custom domain: add in Render, update `NEXT_PUBLIC_SITE_URL`, `RESEND_FROM_EMAIL` domain and
-   Razorpay webhook URL.
+2. **Environment** → add every variable from section 2 (`NODE_ENV=production`, `DATABASE_URL`,
+   `SESSION_SECRET`, `NEXT_PUBLIC_SITE_URL=https://<service>.onrender.com`, `CRON_SECRET`, …).
+   Generate secrets with `openssl rand -base64 48`.
+3. **Storage**: Render's disk is ephemeral → `STORAGE_PROVIDER=s3` with an S3-compatible bucket
+   (Cloudflare R2 is free for this volume: set `S3_ENDPOINT`, `S3_REGION=auto`, `S3_BUCKET`, keys,
+   and `S3_PUBLIC_URL` to the bucket's public domain). Alternative: attach a **Persistent Disk**
+   mounted at `/opt/render/project/src/public/uploads` and keep `STORAGE_PROVIDER=local`.
+4. Deploy. The start command applies migrations; then open the service **Shell** and run
+   `npm run prisma:seed` once.
+5. **Cron**: Render → **New → Cron Job** (same repo, same env vars):
+   - every 5 min: `curl -fsS -H "Authorization: Bearer $CRON_SECRET" https://<domain>/api/cron/expire-holds`
+   - every 6 h: `curl -fsS -H "Authorization: Bearer $CRON_SECRET" "https://<domain>/api/cron/expire-holds?instagram=1"`
+6. Custom domain → **Settings → Custom Domains**, then update NEXT_PUBLIC_SITE_URL, EMAIL_FROM`r
+   and the Razorpay webhook URL.
 
-Deployments are automatic on every push to the connected branch. Migrations are forward-only;
-create them locally with `prisma migrate dev` and commit the SQL.
+Auto-deploys on every push. Free-tier instances sleep after inactivity (first request is slow);
+a paid instance avoids this and keeps the in-memory rate limiter warm.
+
+### 13.3 Vercel
+
+Vercel runs each route as a serverless function. The repo already includes a
+[`vercel.json`](vercel.json) with the build command, region and cron schedules, and
+`next.config.ts` marks `pdfkit`/`pg`/Prisma as server-external so receipt PDFs render correctly in
+functions.
+
+1. **Import**: [vercel.com/new](https://vercel.com/new) → import the GitHub repo. Framework is
+   auto-detected as Next.js. Leave *Root Directory* as `.`; the build command
+   `prisma migrate deploy && npm run build` comes from `vercel.json` (migrations run at build time,
+   before the new version goes live).
+2. **Environment variables** (Project → Settings → Environment Variables, scope *Production* — add
+   *Preview* too if you want preview deployments to work against a separate database):
+
+   | Variable | Value |
+   | --- | --- |
+   | `DATABASE_URL` | Aiven **pooled** URI (PgBouncer, transaction mode) with `?sslmode=require` |
+   | `DATABASE_POOL_MAX` | `2` |
+   | `SESSION_SECRET`, `CRON_SECRET` | `openssl rand -base64 48` each |
+   | `NEXT_PUBLIC_SITE_URL` | `https://<project>.vercel.app` (update after adding a domain) |
+   | `STORAGE_PROVIDER` | `s3` — **required**; the Vercel filesystem is read-only |
+   | `S3_ENDPOINT`, `S3_REGION`, `S3_BUCKET`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY`, `S3_PUBLIC_URL` | Cloudflare R2 / AWS S3 / Backblaze B2 |
+   | `RAZORPAY_*`, `SMTP_*`, `EMAIL_FROM`, `OWNER_NOTIFICATION_EMAIL`, `INSTAGRAM_*` | as needed |
+   | `ADMIN_EMAIL`, `ADMIN_PASSWORD`, `ADMIN_NAME` | only until the seed has run |
+
+   `NODE_ENV` is set by Vercel automatically. Do **not** add `.env` to git — paste values in the
+   dashboard or use `vercel env pull` locally.
+3. **Deploy** (button, or push to `main`). Check the build log for `prisma migrate deploy` output.
+4. **Seed the admin** once, from your machine, against the production database:
+
+   ```bash
+   npm i -g vercel && vercel login && vercel link
+   vercel env pull .env.production.local          # downloads the production env (git-ignored)
+   npx dotenv-cli -e .env.production.local -- npm run prisma:seed
+   ```
+
+   (`prisma.config.ts` loads `.env` automatically, so simply copying the production values into
+   a local `.env` and running `npm run prisma:seed` works too — just don't forget to switch it back.)
+5. **Cron**: `vercel.json` registers `/api/cron/expire-holds` every 5 minutes and the Instagram
+   variant every 6 hours. Vercel sends `Authorization: Bearer $CRON_SECRET` automatically once the
+   `CRON_SECRET` variable exists, which is exactly what the route expects. Note the plan limits:
+   the **Hobby** plan allows 2 cron jobs at most once per day — change both schedules to e.g.
+   `0 3 * * *` there (hold expiry also happens lazily inside every booking transaction, so this is
+   safe); **Pro** supports the 5-minute schedule.
+6. **Region**: `vercel.json` pins functions to `bom1` (Mumbai) to sit next to Indian guests and the
+   Aiven service; change it to match your database region.
+7. **Domain**: Project → Settings → Domains → add your domain, then update `NEXT_PUBLIC_SITE_URL`,
+   `EMAIL_FROM` and the Razorpay webhook URL (`https://<domain>/api/payments/webhook`)
+   and redeploy.
+
+Vercel-specific behaviour to know:
+
+- The in-memory rate limiter is per function instance, so limits are softer than on a single
+  server. Swap `src/lib/rate-limit.ts` for an Upstash/Redis store if abuse becomes a concern.
+- Post-payment side effects (emails, receipt PDF) run in the request that confirmed the booking;
+  on Vercel keep an eye on function duration (default 10 s on Hobby, configurable on Pro). The
+  webhook route is retried by Razorpay if it ever times out, and settlement is idempotent.
+- Preview deployments share whatever `DATABASE_URL` you give them — use a separate scratch
+  database for the *Preview* environment or leave it unset.
+
+### 13.4 Any VPS or Docker host
+
+```bash
+# on the server (Ubuntu example)
+curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash - && sudo apt-get install -y nodejs
+git clone <repo> /srv/asl-bhavan && cd /srv/asl-bhavan
+npm ci && npm run build
+cp .env.example .env && nano .env            # production values, STORAGE_PROVIDER=s3 or a persistent /public/uploads
+npm run prisma:deploy && npm run prisma:seed
+PORT=3000 NODE_ENV=production npm run start  # put behind nginx/Caddy for TLS; run under pm2 or systemd
+```
+
+Add two crontab entries mirroring the Render ones (`*/5 * * * *` and `0 */6 * * *`) with
+`curl -fsS -H "Authorization: Bearer $CRON_SECRET" http://127.0.0.1:3000/api/cron/expire-holds`.
+
+Migrations are forward-only on every host: create them locally with `npm run prisma:migrate -- --name <change>`
+and commit the generated SQL; deployments apply them with `prisma migrate deploy`.
 
 ---
 
@@ -430,7 +594,8 @@ pg_restore --no-owner --dbname="$NEW_DATABASE_URL" asl-bhavan-YYYY-MM-DD.dump
 | Exclusion constraint error on migrate                          | Ensure the DB user can `CREATE EXTENSION btree_gist` (Aiven `avnadmin` can)           |
 | "Pay online" option not shown                                  | `RAZORPAY_KEY_ID` + `RAZORPAY_KEY_SECRET` missing, or disabled in Settings → Booking   |
 | Webhook returns 400                                            | `RAZORPAY_WEBHOOK_SECRET` mismatch; the body must reach the app unmodified            |
-| Emails show FAILED in Admin → Emails                           | Check `RESEND_*`; verify the sending domain in Resend; use **Resend** after fixing     |
+| Emails show FAILED in Admin → Emails                           | Use **Send test email**; check `SMTP_*` (Gmail needs an App Password, port 587 + `SMTP_SECURE=false`); then **Resend** |
+| `self-signed certificate in certificate chain`                 | Handled automatically for `sslmode=require`; for full verification set `DATABASE_CA_CERT` to Aiven's CA PEM |
 | Uploaded images vanish after deploy                            | Local storage on Render is ephemeral — switch to `STORAGE_PROVIDER=s3`                |
 | Instagram sync fails with 190                                  | Token expired; generate a new long-lived token                                        |
 

@@ -49,8 +49,9 @@ const nextConfig: NextConfig = {
   async headers() {
     return [{ source: "/(.*)", headers: securityHeaders }];
   },
-  // Native modules used only on the server.
-  serverExternalPackages: ["pg", "bcryptjs", "@prisma/client", "@prisma/adapter-pg"],
+  // Native / asset-carrying modules used only on the server. pdfkit must stay external so its
+  // bundled font metric files (.afm) are traced into serverless functions (Vercel) intact.
+  serverExternalPackages: ["pg", "bcryptjs", "@prisma/client", "@prisma/adapter-pg", "pdfkit"],
 };
 
 export default nextConfig;

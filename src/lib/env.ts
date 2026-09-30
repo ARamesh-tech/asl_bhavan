@@ -18,6 +18,8 @@ const serverSchema = z.object({
 
   DATABASE_URL: z.string().min(1, "DATABASE_URL is required"),
   DATABASE_POOL_MAX: z.coerce.number().int().min(1).max(50).default(5),
+  /** Optional PEM of the database CA (Aiven "CA certificate") to enable full TLS verification. */
+  DATABASE_CA_CERT: optionalString,
 
   SESSION_SECRET: z
     .string()
@@ -31,8 +33,14 @@ const serverSchema = z.object({
   RAZORPAY_KEY_SECRET: optionalString,
   RAZORPAY_WEBHOOK_SECRET: optionalString,
 
-  RESEND_API_KEY: optionalString,
-  RESEND_FROM_EMAIL: optionalString,
+  SMTP_HOST: optionalString,
+  SMTP_PORT: z.coerce.number().int().min(1).max(65535).default(587),
+  /** true = implicit TLS (port 465). false = STARTTLS upgrade (port 587, the default). */
+  SMTP_SECURE: z.preprocess((v) => (v === "true" || v === "1" ? true : v === "false" || v === "0" || v === "" ? false : v), z.boolean().default(false)),
+  SMTP_USER: optionalString,
+  SMTP_PASS: optionalString,
+  /** Sender shown to guests, e.g. `ASL Bhavan <bookings@aslbhavan.com>`. */
+  EMAIL_FROM: optionalString,
   OWNER_NOTIFICATION_EMAIL: optionalString,
 
   INSTAGRAM_ACCESS_TOKEN: optionalString,
@@ -82,7 +90,7 @@ export function integrations() {
   return {
     razorpay: Boolean(env.RAZORPAY_KEY_ID && env.RAZORPAY_KEY_SECRET),
     razorpayWebhook: Boolean(env.RAZORPAY_WEBHOOK_SECRET),
-    email: Boolean(env.RESEND_API_KEY && env.RESEND_FROM_EMAIL),
+    email: Boolean(env.SMTP_HOST && env.EMAIL_FROM),
     instagram: Boolean(env.INSTAGRAM_ACCESS_TOKEN && env.INSTAGRAM_ACCOUNT_ID),
     s3Storage:
       env.STORAGE_PROVIDER === "s3" &&

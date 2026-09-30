@@ -1,6 +1,6 @@
 import type { Metadata } from "next";
 import Link from "next/link";
-import { RotateCcw } from "lucide-react";
+import { RotateCcw, Send } from "lucide-react";
 import { ActionButton } from "@/components/admin/action-button";
 import { AdminPageHeader } from "@/components/admin/page-header";
 import { PaginationNav } from "@/components/layout/pagination-nav";
@@ -33,9 +33,13 @@ export default async function AdminEmailsPage({ searchParams }: { searchParams: 
 
   return (
     <>
-      <AdminPageHeader title="Emails" description="Delivery log for every email the system sends. Failed booking and receipt emails can be resent." />
+      <AdminPageHeader
+        title="Emails"
+        description="Delivery log for every email the system sends. Failed booking and receipt emails can be resent."
+        actions={configured ? <ActionButton url="/api/admin/emails/test" successMessage="Test email sent to your inbox" variant="outline" size="default"><Send aria-hidden /> Send test email</ActionButton> : undefined}
+      />
       {!configured && (
-        <p className="mb-4 rounded-2xl border border-status-partial/40 bg-status-partial-soft/40 p-4 text-sm">Email delivery is not configured. Set <code>RESEND_API_KEY</code> and <code>RESEND_FROM_EMAIL</code> in the environment to enable sending.</p>
+        <p className="mb-4 rounded-2xl border border-status-partial/40 bg-status-partial-soft/40 p-4 text-sm">Email delivery is not configured. Set <code>SMTP_HOST</code>, <code>SMTP_USER</code>, <code>SMTP_PASS</code> and <code>EMAIL_FROM</code> in the environment to enable sending.</p>
       )}
       <nav aria-label="Filter" className="mb-4 flex flex-wrap gap-2">
         {[{ id: undefined, label: "All" }, ...STATUSES.map((s) => ({ id: s, label: `${s[0]}${s.slice(1).toLowerCase()} (${count(s)})` }))].map((f) => (

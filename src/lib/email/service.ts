@@ -1,11 +1,12 @@
 import "server-only";
-import { Resend } from "resend";
+import nodemailer, { type Transporter } from "nodemailer";
 import { prisma } from "@/lib/db/prisma";
 import { getEnv, integrations } from "@/lib/env";
 import { logger } from "@/lib/logger";
 
 /**
- * Email service (Resend).
+ * Email service (SMTP via nodemailer — works with Gmail/Google Workspace app passwords,
+ * Zoho, Brevo, Amazon SES, Mailgun, or any provider that exposes SMTP).
  *
  * Every send is recorded in EmailLog first, then attempted. Failures never throw to the
  * caller — a confirmed booking must never be rolled back because an email failed. Admins
@@ -28,27 +29,53 @@ export type SendEmailInput = {
 
 export type SendEmailResult = { emailLogId: string; status: "SENT" | "FAILED"; error?: string };
 
-let client: Resend | null = null;
-function getClient(): Resend | null {
+let transporter: Transporter | null = null;
+function getTransporter(): Transporter | null {
   if (!integrations().email) return null;
-  if (!client) client = new Resend(getEnv().RESEND_API_KEY);
-  return client;
+  if (!transporter) {
+    const env = getEnv();
+    transporter = nodemailer.createTransport({
+      host: env.SMTP_HOST,
+      port: env.SMTP_PORT,
+      secure: env.SMTP_SECURE,
+      auth: env.SMTP_USER ? { user: env.SMTP_USER, pass: env.SMTP_PASS ?? "" } : undefined,
+      pool: true,
+      maxConnections: 2,
+      connectionTimeout: 15_000,
+      socketTimeout: 30_000,
+    });
+  }
+  return transporter;
 }
 
 async function deliver(input: SendEmailInput): Promise<{ id: string | null; error?: string }> {
-  const resend = getClient();
-  if (!resend) return { id: null, error: "Email is not configured (RESEND_API_KEY / RESEND_FROM_EMAIL missing)." };
-  const { data, error } = await resend.emails.send({
-    from: getEnv().RESEND_FROM_EMAIL!,
-    to: [input.to],
+  const smtp = getTransporter();
+  if (!smtp) return { id: null, error: "Email is not configured (SMTP_HOST / EMAIL_FROM missing)." };
+  const info = await smtp.sendMail({
+    from: getEnv().EMAIL_FROM!,
+    to: input.to,
     subject: input.subject,
     html: input.html,
     text: input.text,
     replyTo: input.replyTo,
     attachments: input.attachments?.map((a) => ({ filename: a.filename, content: a.content, contentType: a.contentType })),
   });
-  if (error) return { id: null, error: error.message };
-  return { id: data?.id ?? null };
+  if ((info.rejected?.length ?? 0) > 0 && (info.accepted?.length ?? 0) === 0) {
+    return { id: null, error: `Recipient rejected by SMTP server: ${info.response ?? ""}`.trim() };
+  }
+  return { id: info.messageId ?? null };
+}
+
+/** Used by the admin Settings page "Send test email" action. */
+export async function verifySmtpConnection(): Promise<{ ok: boolean; error?: string }> {
+  const smtp = getTransporter();
+  if (!smtp) return { ok: false, error: "SMTP is not configured." };
+  try {
+    await smtp.verify();
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : "SMTP verification failed" };
+  }
 }
 
 export async function sendEmail(input: SendEmailInput): Promise<SendEmailResult> {

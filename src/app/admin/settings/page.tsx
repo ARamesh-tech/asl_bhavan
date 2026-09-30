@@ -81,7 +81,7 @@ export default async function AdminSettingsPage() {
       <div className="mb-6 grid gap-2 rounded-2xl border bg-card p-4 text-sm shadow-soft sm:grid-cols-2 lg:grid-cols-4">
         <Integration name="Razorpay payments" on={flags.razorpay} hint="RAZORPAY_KEY_ID / RAZORPAY_KEY_SECRET" />
         <Integration name="Razorpay webhook" on={flags.razorpayWebhook} hint="RAZORPAY_WEBHOOK_SECRET" />
-        <Integration name="Email (Resend)" on={flags.email} hint="RESEND_API_KEY / RESEND_FROM_EMAIL" />
+        <Integration name="Email (SMTP)" on={flags.email} hint="SMTP_HOST / SMTP_USER / SMTP_PASS / EMAIL_FROM" />
         <Integration name="Instagram sync" on={flags.instagram} hint="INSTAGRAM_ACCESS_TOKEN / INSTAGRAM_ACCOUNT_ID" />
       </div>
       <div className="space-y-6">
