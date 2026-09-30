@@ -1,0 +1,680 @@
+// ASL Bhavan — homestay booking & property-management platform
+// PostgreSQL schema (Prisma ORM 7)
+//
+// Design notes
+// - Money is stored as DECIMAL(10,2) in the property currency (configured in SiteSetting).
+// - Booking date ranges are half-open: [checkIn, checkOut). Two ranges overlap when
+//   existing.checkIn < requested.checkOut AND existing.checkOut > requested.checkIn.
+// - Private rooms are exclusive units; the dormitory is a shared unit whose availability is
+//   capacity - sum(guestCount of active bookings) - sum(bedsBlocked of active blocks).
+// - Double-booking protection = row lock on Room inside the booking transaction (all units)
+//   + a PostgreSQL EXCLUDE constraint on active whole-unit bookings (private rooms), added
+//   via raw SQL in the initial migration (Prisma cannot express exclusion constraints).
+// - Business records (Booking, Payment, Receipt, Room, User) are soft-deleted via deletedAt.
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Enums
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Extensible RBAC roles. Only USER and ADMIN are used in v1; add STAFF/MANAGER later.
+enum Role {
+  USER
+  ADMIN
+}
+
+enum AccommodationType {
+  PRIVATE_ROOM
+  DORMITORY
+}
+
+enum RoomStatus {
+  ACTIVE
+  INACTIVE
+  MAINTENANCE
+}
+
+enum BookingStatus {
+  DRAFT
+  PENDING_PAYMENT
+  OWNER_CONFIRMATION
+  CONFIRMED
+  CHECKED_IN
+  CHECKED_OUT
+  CANCELLED
+  EXPIRED
+  NO_SHOW
+}
+
+enum PaymentStatus {
+  PENDING
+  PAID
+  PARTIAL
+  FAILED
+  REFUNDED
+  CASH
+  DIRECT_UPI
+  BANK_TRANSFER
+  PAY_ON_ARRIVAL
+}
+
+enum PaymentMethod {
+  RAZORPAY
+  CASH
+  DIRECT_UPI
+  BANK_TRANSFER
+  PAY_ON_ARRIVAL
+  OTHER
+}
+
+/// How the booking entered the system (used for reporting: online vs WhatsApp vs manual).
+enum BookingSource {
+  ONLINE
+  WHATSAPP
+  MANUAL
+  PHONE
+  WALK_IN
+}
+
+enum RoomBlockType {
+  MAINTENANCE
+  OWNER_USE
+  PRIVATE_EVENT
+  OTHER
+}
+
+enum PostSource {
+  WEBSITE
+  INSTAGRAM
+}
+
+enum GalleryCategory {
+  ROOMS
+  PROPERTY
+  EXTERIOR
+  FACILITIES
+  NEARBY_ATTRACTIONS
+  EVENTS
+}
+
+enum MessageStatus {
+  NEW
+  READ
+  RESOLVED
+}
+
+enum EmailStatus {
+  PENDING
+  SENT
+  FAILED
+}
+
+enum AuthTokenType {
+  EMAIL_VERIFICATION
+  PASSWORD_RESET
+}
+
+enum SyncStatus {
+  RUNNING
+  SUCCESS
+  FAILED
+  SKIPPED
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Identity & access
+// ─────────────────────────────────────────────────────────────────────────────
+
+model User {
+  id              String    @id @default(cuid())
+  email           String    @unique
+  phone           String?   @unique
+  name            String
+  passwordHash    String
+  role            Role      @default(USER)
+  emailVerifiedAt DateTime?
+  isActive        Boolean   @default(true)
+  lastLoginAt     DateTime?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+  deletedAt       DateTime?
+
+  sessions          Session[]
+  authTokens        AuthToken[]
+  bookings          Booking[]      @relation("BookingCustomer")
+  createdBookings   Booking[]      @relation("BookingCreatedBy")
+  confirmedBookings Booking[]      @relation("BookingConfirmedBy")
+  cancelledBookings Booking[]      @relation("BookingCancelledBy")
+  roomBlocks        RoomBlock[]
+  roomPrices        RoomPrice[]
+  recordedPayments  Payment[]
+  generatedReceipts Receipt[]
+  posts             Post[]
+  galleryImages     GalleryImage[]
+  auditLogs         AuditLog[]
+  settingsUpdated   SiteSetting[]
+
+  @@index([role])
+  @@index([deletedAt])
+}
+
+/// Opaque, DB-backed sessions. Only a SHA-256 hash of the cookie token is stored.
+model Session {
+  id        String   @id @default(cuid())
+  tokenHash String   @unique
+  userId    String
+  expiresAt DateTime
+  ipAddress String?
+  userAgent String?
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+}
+
+/// Single-use tokens for email verification and password reset (hash stored only).
+model AuthToken {
+  id        String        @id @default(cuid())
+  userId    String
+  type      AuthTokenType
+  tokenHash String        @unique
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime      @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, type])
+  @@index([expiresAt])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Inventory
+// ─────────────────────────────────────────────────────────────────────────────
+
+model Room {
+  id               String            @id @default(cuid())
+  slug             String            @unique
+  name             String
+  roomNumber       String?           @unique
+  type             AccommodationType @default(PRIVATE_ROOM)
+  /// Display category, e.g. "Deluxe Room", "Family Room", "Mixed Dormitory"
+  category         String
+  shortDescription String?
+  description      String
+  /// Maximum guests for a private room; total beds for a dormitory.
+  capacity         Int
+  minGuests        Int               @default(1)
+  maxGuests        Int
+  /// Per-night price for the whole unit (private rooms).
+  basePrice        Decimal           @db.Decimal(10, 2)
+  /// Per-person, per-night price (dormitory). Null for private rooms.
+  pricePerPerson   Decimal?          @db.Decimal(10, 2)
+  /// Optional weekend (Fri/Sat night) override of basePrice / pricePerPerson.
+  weekendPrice     Decimal?          @db.Decimal(10, 2)
+  bedConfiguration String?
+  sizeSqFt         Int?
+  floor            String?
+  rules            String?
+  status           RoomStatus        @default(ACTIVE)
+  isActive         Boolean           @default(true)
+  isFeatured       Boolean           @default(false)
+  sortOrder        Int               @default(0)
+  createdAt        DateTime          @default(now())
+  updatedAt        DateTime          @updatedAt
+  deletedAt        DateTime?
+
+  images    RoomImage[]
+  amenities RoomAmenity[]
+  blocks    RoomBlock[]
+  prices    RoomPrice[]
+  bookings  Booking[]
+
+  @@index([isActive, status])
+  @@index([type])
+  @@index([sortOrder])
+}
+
+model RoomImage {
+  id         String   @id @default(cuid())
+  roomId     String
+  url        String
+  storageKey String?
+  alt        String?
+  caption    String?
+  isPrimary  Boolean  @default(false)
+  sortOrder  Int      @default(0)
+  createdAt  DateTime @default(now())
+
+  room Room @relation(fields: [roomId], references: [id], onDelete: Cascade)
+
+  @@index([roomId, sortOrder])
+}
+
+/// Master list of amenities (managed by admin, also used for the homepage Amenities section).
+model Amenity {
+  id        String   @id @default(cuid())
+  name      String   @unique
+  /// Lucide icon name, e.g. "wifi", "wind", "car"
+  icon      String?
+  category  String?
+  sortOrder Int      @default(0)
+  createdAt DateTime @default(now())
+
+  rooms RoomAmenity[]
+}
+
+model RoomAmenity {
+  roomId    String
+  amenityId String
+  createdAt DateTime @default(now())
+
+  room    Room    @relation(fields: [roomId], references: [id], onDelete: Cascade)
+  amenity Amenity @relation(fields: [amenityId], references: [id], onDelete: Cascade)
+
+  @@id([roomId, amenityId])
+  @@index([amenityId])
+}
+
+/// Manual admin blocks (maintenance, owner use). Half-open range [startDate, endDate).
+model RoomBlock {
+  id          String        @id @default(cuid())
+  roomId      String
+  startDate   DateTime      @db.Date
+  endDate     DateTime      @db.Date
+  type        RoomBlockType @default(OTHER)
+  reason      String?
+  /// Dormitory only: number of beds blocked. Null = entire unit blocked.
+  bedsBlocked Int?
+  createdById String?
+  createdAt   DateTime      @default(now())
+  updatedAt   DateTime      @updatedAt
+
+  room      Room  @relation(fields: [roomId], references: [id], onDelete: Cascade)
+  createdBy User? @relation(fields: [createdById], references: [id], onDelete: SetNull)
+
+  @@index([roomId])
+  @@index([startDate])
+  @@index([endDate])
+  @@index([roomId, startDate, endDate])
+}
+
+/// Date-specific price overrides (seasonal / holiday / special). Half-open range.
+model RoomPrice {
+  id             String   @id @default(cuid())
+  roomId         String
+  startDate      DateTime @db.Date
+  endDate        DateTime @db.Date
+  price          Decimal  @db.Decimal(10, 2)
+  pricePerPerson Decimal? @db.Decimal(10, 2)
+  reason         String?
+  /// Higher priority wins when overrides overlap.
+  priority       Int      @default(0)
+  createdById    String?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  room      Room  @relation(fields: [roomId], references: [id], onDelete: Cascade)
+  createdBy User? @relation(fields: [createdById], references: [id], onDelete: SetNull)
+
+  @@index([roomId, startDate, endDate])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Bookings & payments
+// ─────────────────────────────────────────────────────────────────────────────
+
+model Booking {
+  id               String        @id @default(cuid())
+  /// Human-readable reference: ASL-YYYYMMDD-A001
+  bookingReference String        @unique
+  roomId           String
+  /// Customer account (null for admin/manual bookings of guests without an account).
+  userId           String?
+  status           BookingStatus @default(DRAFT)
+  paymentStatus    PaymentStatus @default(PENDING)
+  source           BookingSource @default(ONLINE)
+
+  checkIn         DateTime @db.Date
+  checkOut        DateTime @db.Date
+  nights          Int
+  guestCount      Int
+  /// True for private rooms (occupies the whole unit), false for dormitory beds.
+  /// Used by the EXCLUDE constraint that prevents overlapping whole-unit bookings.
+  blocksWholeUnit Boolean  @default(true)
+
+  // Primary contact (denormalised for fast listing/search; full list in BookingGuest)
+  guestName  String
+  guestEmail String
+  guestPhone String
+
+  // Amounts — calculated server-side by the pricing service; never trusted from client
+  currency          String  @default("INR")
+  roomCharges       Decimal @db.Decimal(10, 2)
+  additionalCharges Decimal @default(0) @db.Decimal(10, 2)
+  discount          Decimal @default(0) @db.Decimal(10, 2)
+  taxRate           Decimal @default(0) @db.Decimal(5, 2)
+  taxAmount         Decimal @default(0) @db.Decimal(10, 2)
+  totalAmount       Decimal @db.Decimal(10, 2)
+  amountPaid        Decimal @default(0) @db.Decimal(10, 2)
+  /// Per-night price breakdown captured at booking time (audit trail for price changes).
+  pricingSnapshot   Json?
+
+  /// PENDING_PAYMENT bookings expire and release inventory after this time.
+  holdExpiresAt DateTime?
+
+  specialRequests String?
+  internalNotes   String?
+
+  confirmedAt        DateTime?
+  confirmedById      String?
+  actualCheckInAt    DateTime?
+  actualCheckOutAt   DateTime?
+  cancelledAt        DateTime?
+  cancelledById      String?
+  cancellationReason String?
+  createdById        String?
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  room        Room  @relation(fields: [roomId], references: [id], onDelete: Restrict)
+  user        User? @relation("BookingCustomer", fields: [userId], references: [id], onDelete: SetNull)
+  createdBy   User? @relation("BookingCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+  confirmedBy User? @relation("BookingConfirmedBy", fields: [confirmedById], references: [id], onDelete: SetNull)
+  cancelledBy User? @relation("BookingCancelledBy", fields: [cancelledById], references: [id], onDelete: SetNull)
+
+  guests    BookingGuest[]
+  payments  Payment[]
+  receipt   Receipt?
+  emailLogs EmailLog[]
+
+  @@index([roomId])
+  @@index([checkIn])
+  @@index([checkOut])
+  @@index([status])
+  @@index([paymentStatus])
+  @@index([userId])
+  @@index([source])
+  @@index([holdExpiresAt])
+  @@index([guestPhone])
+  @@index([guestEmail])
+  @@index([createdAt])
+  /// Primary availability query: active bookings of a room overlapping a date range.
+  @@index([roomId, status, checkIn, checkOut])
+}
+
+/// Individual guests on a booking. ID fields are sensitive — admin-only, never returned to
+/// customer-facing APIs. Store only what is operationally necessary.
+model BookingGuest {
+  id          String   @id @default(cuid())
+  bookingId   String
+  fullName    String
+  email       String?
+  phone       String?
+  age         Int?
+  address     String?
+  isPrimary   Boolean  @default(false)
+  /// e.g. "AADHAAR", "PASSPORT" — sensitive
+  idType      String?
+  /// Masked reference only (e.g. last 4 digits) — sensitive
+  idReference String?
+  createdAt   DateTime @default(now())
+
+  booking Booking @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+
+  @@index([bookingId])
+}
+
+model Payment {
+  id        String        @id @default(cuid())
+  bookingId String
+  amount    Decimal       @db.Decimal(10, 2)
+  currency  String        @default("INR")
+  method    PaymentMethod
+  status    PaymentStatus @default(PENDING)
+
+  // Razorpay (online)
+  razorpayOrderId   String? @unique
+  razorpayPaymentId String? @unique
+  razorpaySignature String?
+
+  /// Generic reference: UPI txn id, bank UTR, cash receipt no., etc.
+  transactionId  String?
+  paidAt         DateTime?
+  failureReason  String?
+  refundedAmount Decimal   @default(0) @db.Decimal(10, 2)
+  refundId       String?
+  refundedAt     DateTime?
+  notes          String?
+  /// Admin who recorded a manual payment.
+  recordedById   String?
+  metadata       Json?
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  booking    Booking        @relation(fields: [bookingId], references: [id], onDelete: Restrict)
+  recordedBy User?          @relation(fields: [recordedById], references: [id], onDelete: SetNull)
+  events     PaymentEvent[]
+  receipts   Receipt[]
+
+  @@index([bookingId])
+  @@index([transactionId])
+  @@index([status])
+  @@index([method])
+  @@index([paidAt])
+}
+
+/// Provider webhook/event ledger for idempotency. A webhook delivered twice is a no-op.
+model PaymentEvent {
+  id          String    @id @default(cuid())
+  provider    String    @default("razorpay")
+  /// Provider event id (Razorpay `x-razorpay-event-id`), unique per provider.
+  eventId     String
+  eventType   String
+  paymentId   String?
+  payload     Json
+  processedAt DateTime?
+  error       String?
+  createdAt   DateTime  @default(now())
+
+  payment Payment? @relation(fields: [paymentId], references: [id], onDelete: SetNull)
+
+  @@unique([provider, eventId])
+  @@index([paymentId])
+  @@index([eventType])
+}
+
+/// One receipt per booking (idempotent). Regeneration re-renders the PDF but keeps the number.
+model Receipt {
+  id              String    @id @default(cuid())
+  /// ASL-RCP-YYYYMMDD-0001
+  receiptNumber   String    @unique
+  bookingId       String    @unique
+  paymentId       String?
+  issuedAt        DateTime  @default(now())
+  /// Frozen line items / totals / property details at time of issue.
+  snapshot        Json
+  totalAmount     Decimal   @db.Decimal(10, 2)
+  currency        String    @default("INR")
+  pdfStorageKey   String?
+  pdfUrl          String?
+  generatedById   String?
+  regenerateCount Int       @default(0)
+  lastGeneratedAt DateTime?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+  deletedAt       DateTime?
+
+  booking     Booking    @relation(fields: [bookingId], references: [id], onDelete: Restrict)
+  payment     Payment?   @relation(fields: [paymentId], references: [id], onDelete: SetNull)
+  generatedBy User?      @relation(fields: [generatedById], references: [id], onDelete: SetNull)
+  emailLogs   EmailLog[]
+
+  @@index([issuedAt])
+}
+
+/// Atomic per-day counters used for booking references and receipt numbers.
+model DailySequence {
+  kind    String
+  dateKey String
+  value   Int    @default(0)
+
+  @@id([kind, dateKey])
+}
+
+/// Outbound email ledger with retry support.
+model EmailLog {
+  id                String      @id @default(cuid())
+  to                String
+  subject           String
+  template          String
+  status            EmailStatus @default(PENDING)
+  providerMessageId String?
+  error             String?
+  attempts          Int         @default(0)
+  lastAttemptAt     DateTime?
+  sentAt            DateTime?
+  bookingId         String?
+  receiptId         String?
+  createdAt         DateTime    @default(now())
+  updatedAt         DateTime    @updatedAt
+
+  booking Booking? @relation(fields: [bookingId], references: [id], onDelete: SetNull)
+  receipt Receipt? @relation(fields: [receiptId], references: [id], onDelete: SetNull)
+
+  @@index([status])
+  @@index([bookingId])
+  @@index([createdAt])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Content
+// ─────────────────────────────────────────────────────────────────────────────
+
+model Post {
+  id              String     @id @default(cuid())
+  title           String
+  slug            String     @unique
+  caption         String?
+  imageUrl        String?
+  imageStorageKey String?
+  source          PostSource @default(WEBSITE)
+  instagramPostId String?    @unique
+  instagramUrl    String?
+  publishedAt     DateTime?
+  isPublished     Boolean    @default(false)
+  isArchived      Boolean    @default(false)
+  sortOrder       Int        @default(0)
+  createdById     String?
+  createdAt       DateTime   @default(now())
+  updatedAt       DateTime   @updatedAt
+
+  createdBy User? @relation(fields: [createdById], references: [id], onDelete: SetNull)
+
+  @@index([publishedAt])
+  @@index([isPublished, isArchived])
+  @@index([source])
+}
+
+model InstagramSyncLog {
+  id           String     @id @default(cuid())
+  status       SyncStatus @default(RUNNING)
+  fetchedCount Int        @default(0)
+  createdCount Int        @default(0)
+  updatedCount Int        @default(0)
+  error        String?
+  startedAt    DateTime   @default(now())
+  finishedAt   DateTime?
+
+  @@index([startedAt])
+}
+
+model GalleryImage {
+  id           String          @id @default(cuid())
+  url          String
+  storageKey   String?
+  alt          String?
+  caption      String?
+  category     GalleryCategory @default(PROPERTY)
+  isFeatured   Boolean         @default(false)
+  isPublished  Boolean         @default(true)
+  sortOrder    Int             @default(0)
+  uploadedById String?
+  createdAt    DateTime        @default(now())
+  updatedAt    DateTime        @updatedAt
+
+  uploadedBy User? @relation(fields: [uploadedById], references: [id], onDelete: SetNull)
+
+  @@index([category, sortOrder])
+  @@index([isFeatured])
+}
+
+model ContactMessage {
+  id         String        @id @default(cuid())
+  name       String
+  email      String
+  phone      String?
+  message    String
+  status     MessageStatus @default(NEW)
+  adminNotes String?
+  ipAddress  String?
+  resolvedAt DateTime?
+  createdAt  DateTime      @default(now())
+  updatedAt  DateTime      @updatedAt
+
+  @@index([status])
+  @@index([createdAt])
+}
+
+/// Key/value store for property info, website content and operational settings.
+/// Keys and their Zod types are defined in src/lib/settings/definitions.ts.
+model SiteSetting {
+  key         String   @id
+  value       Json
+  group       String   @default("general")
+  updatedById String?
+  updatedAt   DateTime @updatedAt
+
+  updatedBy User? @relation(fields: [updatedById], references: [id], onDelete: SetNull)
+
+  @@index([group])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Audit
+// ─────────────────────────────────────────────────────────────────────────────
+
+model AuditLog {
+  id          String   @id @default(cuid())
+  adminUserId String?
+  /// e.g. ADMIN_UPDATED_ROOM, ADMIN_CONFIRMED_BOOKING
+  action      String
+  entityType  String
+  entityId    String?
+  oldValue    Json?
+  newValue    Json?
+  ipAddress   String?
+  userAgent   String?
+  createdAt   DateTime @default(now())
+
+  adminUser User? @relation(fields: [adminUserId], references: [id], onDelete: SetNull)
+
+  @@index([adminUserId])
+  @@index([entityType, entityId])
+  @@index([action])
+  @@index([createdAt])
+}
